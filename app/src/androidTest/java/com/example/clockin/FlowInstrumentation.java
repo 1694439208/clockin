@@ -81,6 +81,85 @@ public final class FlowInstrumentation extends Instrumentation {
         for(int i=0;i<40;i++) { Notification n=card(id); if(n!=null)return n; SystemClock.sleep(50); }
         throw new AssertionError("notification card missing");
     }
+    private JSONObject roundTripTask(JSONObject record) throws Exception {
+        Class<?> cls=Class.forName("com.example.clockin.ReminderFlow$Task");
+        java.lang.reflect.Method from=cls.getDeclaredMethod("from",JSONObject.class);
+        java.lang.reflect.Method toJson=cls.getDeclaredMethod("toJson");
+        from.setAccessible(true);toJson.setAccessible(true);
+        return (JSONObject)toJson.invoke(from.invoke(null,new JSONObject(record.toString())));
+    }
+    /** Pure construction/serialization checks: never resolve, submit, or launch an external app. */
+    private void prelaunchContractRegression() throws Exception {
+        boolean busyBefore=WeComLauncher.busy();
+        Intent punch=WeComLauncher.punchIntent();
+        check("wxwork://jump?target=punch&tab=1".equals(WeComLauncher.PUNCH_URI),
+                "punch URI exactly matches the user-supplied link");
+        check(Intent.ACTION_VIEW.equals(punch.getAction()),"punch uses ACTION_VIEW rather than launcher action");
+        check("wxwork://jump?target=punch&tab=1".equals(punch.getDataString()),"punch intent preserves exact URI and query");
+        check("com.tencent.wework".equals(punch.getPackage()),"punch intent is bound to WeCom package");
+        check(punch.getFlags()==Intent.FLAG_ACTIVITY_NEW_TASK,"punch intent only adds NEW_TASK");
+        check((punch.getFlags()&(Intent.FLAG_ACTIVITY_CLEAR_TASK|Intent.FLAG_ACTIVITY_CLEAR_TOP
+                        |Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED))==0,
+                "punch intent never clears or resets the existing WeCom stack");
+        check(punch.getComponent()==null,"punch does not hard-code a private WeCom activity");
+        punch.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TASK);
+        check(WeComLauncher.punchIntent().getFlags()==Intent.FLAG_ACTIVITY_NEW_TASK,
+                "each punch intent is fresh and cannot inherit a caller's flags");
+
+        long oldPrelaunch=System.currentTimeMillis()-TaskPolicy.LAUNCH_CONFIRM_MS-1000;
+        JSONObject fixture=new JSONObject().put("id","prelaunch-contract-fixture").put("type",2)
+                .put("workday",day).put("start",oldPrelaunch-1000).put("end",oldPrelaunch+60000)
+                .put("state",ReminderFlow.WAITING_UNLOCK).put("result",ReminderFlow.RESULT_UNVERIFIED)
+                .put("launch","not_attempted").put("attempts",0).put("automaticAttempts",0)
+                .put("attemptedAt",0).put("requestId","").put("foregroundConfirmed",false)
+                .put("foregroundObserved",false).put("prelaunchAttempted",true)
+                .put("prelaunchSubmitted",true).put("prelaunchOutcome",WeComLauncher.SUBMITTED)
+                .put("prelaunchAt",oldPrelaunch);
+        JSONObject restored=roundTripTask(fixture);
+        check(restored.getBoolean("prelaunchAttempted") && restored.getBoolean("prelaunchSubmitted"),
+                "task round-trip preserves the persistent attempted/submitted ledger");
+        check(restored.getInt("prelaunchOutcome")==WeComLauncher.SUBMITTED
+                        && restored.getLong("prelaunchAt")==oldPrelaunch,
+                "task round-trip preserves prelaunch outcome and timestamp");
+        check(ReminderFlow.WAITING_UNLOCK.equals(restored.getString("state"))
+                        && "not_attempted".equals(restored.getString("launch")),
+                "old locked prelaunch stays outside the five-second foreground request state");
+        check(ReminderFlow.RESULT_UNVERIFIED.equals(restored.getString("result")),
+                "submitted locked prelaunch never confirms attendance or becomes unknown by serialization");
+        check(restored.getInt("attempts")==0 && restored.getInt("automaticAttempts")==0
+                        && restored.getLong("attemptedAt")==0 && restored.getString("requestId").isEmpty(),
+                "prelaunch ledger does not consume unlocked attempts, cooldown, or request identity");
+        check(!restored.getBoolean("foregroundObserved") && !restored.getBoolean("foregroundConfirmed"),
+                "intent submission is not foreground observation or causal confirmation");
+        check(!TaskPolicy.shouldPrelaunch(true,false,true,false,restored.getBoolean("prelaunchAttempted"),
+                        restored.getInt("attempts")),
+                "restored prelaunch write-ahead ledger prevents a duplicate locked submission");
+        for (int outcome:new int[]{WeComLauncher.BLOCKED,WeComLauncher.BACKGROUND_BLOCKED,
+                WeComLauncher.NOT_INSTALLED,WeComLauncher.PUNCH_UNAVAILABLE}) {
+            JSONObject failed=new JSONObject(fixture.toString()).put("prelaunchSubmitted",false)
+                    .put("prelaunchOutcome",outcome);
+            JSONObject recovered=roundTripTask(failed);
+            check(recovered.getBoolean("prelaunchAttempted") && !recovered.getBoolean("prelaunchSubmitted")
+                            && recovered.getInt("prelaunchOutcome")==outcome,
+                    "unsent/failed prelaunch outcome survives task round-trip outcome="+outcome);
+            check(ReminderFlow.WAITING_UNLOCK.equals(recovered.getString("state"))
+                            && ReminderFlow.RESULT_UNVERIFIED.equals(recovered.getString("result"))
+                            && !TaskPolicy.shouldReusePrelaunch(true,true,recovered.getBoolean("prelaunchSubmitted"),true),
+                    "unsent prelaunch remains eligible for ordinary unlocked fallback outcome="+outcome);
+        }
+        JSONObject legacy=new JSONObject(fixture.toString());
+        for (String key:new String[]{"prelaunchAttempted","prelaunchSubmitted","prelaunchOutcome","prelaunchAt"})
+            legacy.remove(key);
+        JSONObject upgraded=roundTripTask(legacy);
+        check(!upgraded.getBoolean("prelaunchAttempted") && !upgraded.getBoolean("prelaunchSubmitted"),
+                "legacy task defaults do not invent a submitted prelaunch");
+        check(upgraded.getInt("prelaunchOutcome")==WeComLauncher.BLOCKED && upgraded.getLong("prelaunchAt")==0,
+                "legacy task defaults use blocked outcome and no prelaunch timestamp");
+        check(TaskPolicy.shouldPrelaunch(true,false,true,false,upgraded.getBoolean("prelaunchAttempted"),
+                        upgraded.getInt("attempts")),
+                "legacy zero-attempt task can take its first eligible locked prelaunch");
+        check(WeComLauncher.busy()==busyBefore,"pure intent and task checks never create a pending foreground timer");
+    }
     private void feedbackRegression() throws Exception {
         newTask(ReminderFlow.MODE_SILENT);
         String id=fresh(2).getString("id");
@@ -157,13 +236,13 @@ public final class FlowInstrumentation extends Instrumentation {
                 ReminderFlow.cancel(c,"alarm_fixture_reset");p().edit().clear().commit();setup();
                 AttendanceRules.setReminderMode(c,ReminderFlow.MODE_REMINDER);
                 java.lang.reflect.Method alarm=AlarmScheduler.class.getDeclaredMethod("scheduleAt",Context.class,
-                        LocalDate.class,int.class,long.class,int.class);alarm.setAccessible(true);
-                alarm.invoke(null,c,LocalDate.ofEpochDay(day),2,System.currentTimeMillis()+1000,0);
+                        LocalDate.class,int.class,long.class,int.class,String.class);alarm.setAccessible(true);
+                alarm.invoke(null,c,LocalDate.ofEpochDay(day),2,System.currentTimeMillis()+1000,0,day+":2");
             });
             long deliveredBy=SystemClock.uptimeMillis()+6000;
             while(fresh(2)==null && SystemClock.uptimeMillis()<deliveredBy)SystemClock.sleep(50);
             check(fresh(2)!=null,"native alarm receiver creates lunch task while screen is off");
-            expectAttempts(0,"screen-off reminder waits without launch");
+            expectAttempts(0,"screen-off prelaunch does not consume an ordinary unlocked launch attempt");
             String lockId=fresh(2).getString("id");
             Notification lock=awaitCard(lockId);
             check(lock.fullScreenIntent!=null,"locked reminder includes authorized full-screen entry");
@@ -222,7 +301,7 @@ public final class FlowInstrumentation extends Instrumentation {
                 AttendanceRules.setReminderMode(c,ReminderFlow.MODE_REMINDER);ReminderFlow.onModeChanged(c,ReminderFlow.MODE_REMINDER);
             });
             shell("input keyevent 224");screen(true,false);
-            expectAttempts(0,"screen-on with keyguard does not launch");
+            expectAttempts(0,"screen-on with keyguard does not consume an ordinary unlocked launch attempt");
             shell("wm dismiss-keyguard");screen(true,true);
             expectAttempts(1,"actual system unlock broadcast launches reminder once");
             shell("input keyevent 224");expectAttempts(1,"repeated screen-on does not relaunch");
@@ -230,7 +309,7 @@ public final class FlowInstrumentation extends Instrumentation {
             expectAttempts(0,"silent task waits when triggered unlocked");
             shell("input keyevent 223");screen(false,false);
             shell("input keyevent 224");screen(true,false);
-            expectAttempts(0,"silent bright locked screen does not launch");
+            expectAttempts(0,"silent bright locked screen does not consume an ordinary unlocked launch attempt");
             shell("wm dismiss-keyguard");screen(true,true);
             expectAttempts(1,"silent genuine unlock uses common launch gate");
             shell("locksettings set-disabled true");
@@ -264,6 +343,7 @@ public final class FlowInstrumentation extends Instrumentation {
                         backups.put(name,new HashMap<>(prefs.getAll())); prefs.edit().clear().commit();
                     }
                     setup();
+                    prelaunchContractRegression();
                     check(ReminderRuntime.unlocked(c),"test device genuinely unlocked");
                     ReminderFlow.triggered(c,2,day);
                     JSONObject t=task(2); String id=t.getString("id");
