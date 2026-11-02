@@ -160,6 +160,56 @@ public final class FlowInstrumentation extends Instrumentation {
                 "legacy zero-attempt task can take its first eligible locked prelaunch");
         check(WeComLauncher.busy()==busyBefore,"pure intent and task checks never create a pending foreground timer");
     }
+    /** Synthetic foreground metadata; any external intent is intercepted by the observer fixture. */
+    private void prelaunchLocationRegression() throws Exception {
+        String id="prelaunch-location-fixture";
+        int notificationId=999001;
+        ReminderFlow.Window window=ReminderFlow.window(c,AlarmScheduler.ARRIVAL,LocalDate.ofEpochDay(day));
+        JSONObject fixture=new JSONObject().put("id",id).put("type",AlarmScheduler.ARRIVAL)
+                .put("workday",day).put("start",window.start).put("end",window.end)
+                .put("state",ReminderFlow.WAITING_UNLOCK).put("result",ReminderFlow.RESULT_UNVERIFIED)
+                .put("notificationId",notificationId).put("prelaunchAttempted",true)
+                .put("prelaunchSubmitted",true).put("prelaunchOutcome",WeComLauncher.SUBMITTED)
+                .put("prelaunchAt",System.currentTimeMillis()-TaskPolicy.LOCATION_MAX_AGE_MS-1000)
+                .put("locationPending",true).put("locationAutomatic",true)
+                .put("locationUnlockGeneration",p().getLong("unlock_generation",0));
+        java.lang.reflect.Field observer=ClockInAccessibilityService.class.getDeclaredField("instance");
+        observer.setAccessible(true);
+        Object previousObserver=observer.get(null);
+        boolean previousVisible=MainActivity.visible;
+        int[] submissions={0};
+        try {
+            observer.set(null,new ClockInAccessibilityService() {
+                @Override Foreground foreground() { return new Foreground(WeComLauncher.PACKAGE,42); }
+                @Override public void startActivity(Intent intent) { submissions[0]++; }
+            });
+            MainActivity.visible=false;
+            check(OfficeLocation.currentInside(c),"location callback fixture has fresh in-range position");
+            store(roundTripTask(fixture));
+            ReminderFlow.locationReady(c,id);
+            JSONObject reused=fresh(AlarmScheduler.ARRIVAL);
+            check(reused.getInt("attempts")==0 && reused.getInt("automaticAttempts")==0
+                            && submissions[0]==0 && !WeComLauncher.busy(),
+                    "automatic location callback reuses prelaunch without a duplicate intent or timer");
+            check(ReminderFlow.WAITING_USER.equals(reused.getString("state"))
+                            && ReminderFlow.RESULT_UNKNOWN.equals(reused.getString("result"))
+                            && "prelaunch_foreground_observed_page_unverified".equals(reused.getString("resultSource"))
+                            && !reused.getBoolean("locationPending") && reused.getBoolean("foregroundObserved")
+                            && !reused.getBoolean("foregroundConfirmed"),
+                    "refreshed-location prelaunch reuse remains page- and attendance-unverified");
+            fixture.put("locationAutomatic",false);
+            store(roundTripTask(fixture));
+            ReminderFlow.locationReady(c,id);
+            check(fresh(AlarmScheduler.ARRIVAL).getInt("attempts")==1,
+                    "explicit user location callback still enters the normal deep-link launch gate");
+        } finally {
+            WeComLauncher.cancelTask(id);
+            observer.set(null,previousObserver);
+            MainActivity.visible=previousVisible;
+            p().edit().remove("task."+id).commit();
+            c.getSystemService(NotificationManager.class).cancel(id,notificationId);
+        }
+    }
     private void feedbackRegression() throws Exception {
         newTask(ReminderFlow.MODE_SILENT);
         String id=fresh(2).getString("id");
@@ -345,6 +395,7 @@ public final class FlowInstrumentation extends Instrumentation {
                     setup();
                     prelaunchContractRegression();
                     check(ReminderRuntime.unlocked(c),"test device genuinely unlocked");
+                    prelaunchLocationRegression();
                     ReminderFlow.triggered(c,2,day);
                     JSONObject t=task(2); String id=t.getString("id");
                     check(t.getInt("attempts")==0,"silent trigger does not launch while already unlocked");

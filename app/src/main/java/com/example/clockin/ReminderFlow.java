@@ -656,26 +656,6 @@ public final class ReminderFlow {
             log(task.id, "unverified result already reviewed; automatic repeat suppressed");
             return;
         }
-        boolean reusablePrelaunch = RESULT_UNVERIFIED.equals(task.result) && task.attempts == 0
-                && locationSatisfied(c, task);
-        if (TaskPolicy.shouldReusePrelaunch(reusablePrelaunch, unlocked(c),
-                task.prelaunchSubmitted, WeComLauncher.isForeground(c))) {
-            // Only the package is observed. Neither the punch page nor attendance is verified.
-            task.foregroundObserved = true;
-            task.foregroundConfirmed = false;
-            task.state = WAITING_USER;
-            task.launch = "waiting_user";
-            task.result = RESULT_UNKNOWN;
-            task.resultSource = "prelaunch_foreground_observed_page_unverified";
-            task.resultAt = System.currentTimeMillis();
-            task.attemptedAt = task.prelaunchAt;
-            if (saveTask(c, task, "prelaunched WeCom observed after unlock; no duplicate automatic link")) {
-                cancelFullScreen(c, task.id);
-                LockReminderActivity.refresh();
-                postActionNotification(c, task, true, notificationMessage(task), false, false);
-            }
-            return;
-        }
         requestOpen(c, task, source, true, false);
     }
 
@@ -719,6 +699,27 @@ public final class ReminderFlow {
             return;
         }
         task.locationPending = false;
+        // Recheck here so an asynchronous location refresh cannot bypass prelaunch reuse.
+        // Explicit notification/manual actions still submit the link.
+        boolean reusablePrelaunch = automatic && RESULT_UNVERIFIED.equals(task.result) && task.attempts == 0;
+        if (TaskPolicy.shouldReusePrelaunch(reusablePrelaunch, unlocked(c),
+                task.prelaunchSubmitted, WeComLauncher.isForeground(c))) {
+            // Only the package is observed. Neither the punch page nor attendance is verified.
+            task.foregroundObserved = true;
+            task.foregroundConfirmed = false;
+            task.state = WAITING_USER;
+            task.launch = "waiting_user";
+            task.result = RESULT_UNKNOWN;
+            task.resultSource = "prelaunch_foreground_observed_page_unverified";
+            task.resultAt = System.currentTimeMillis();
+            task.attemptedAt = task.prelaunchAt;
+            if (saveTask(c, task, "prelaunched WeCom observed after unlock; no duplicate automatic link")) {
+                cancelFullScreen(c, task.id);
+                LockReminderActivity.refresh();
+                postActionNotification(c, task, true, notificationMessage(task), false, false);
+            }
+            return;
+        }
         task.state = REQUESTING_OPEN;
         task.launch = "requesting";
         task.attempts++;
